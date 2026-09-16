@@ -1,0 +1,182 @@
+name: Deploy Static Site to S3 + CloudFront
+
+# Trunk-based flow: a plain push to main auto-deploys to "dev".
+# Promotion to "test" or "main" is always an explicit, manual
+# workflow_dispatch with the target environment selected.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment to deploy/promote to'
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+          - main
+        default: dev
+
+jobs:
+  resolve-environment:
+    name: Resolve target environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+    steps:
+      - name: Determine environment
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+          else
+            ENVIRONMENT="dev"
+          fi
+          echo "Resolved environment: $ENVIRONMENT"
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to S3
+    needs: resolve-environment
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-environment.outputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect project type
+        id: detect
+        run: |
+          if [ -f "src/package.json" ]; then
+            echo "🟢 Node.js project detected in src/"
+            echo "is_node=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "📄 Plain static site detected in src/ (no package.json)"
+            echo "is_node=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
+        if: steps.detect.outputs.is_node == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION || '20' }}
+          cache: 'npm'
+          cache-dependency-path: src/package-lock.json
+
+      - name: Install dependencies
+        if: steps.detect.outputs.is_node == 'true'
+        working-directory: src
+        run: npm ci
+
+      - name: Build project
+        if: steps.detect.outputs.is_node == 'true'
+        working-directory: src
+        run: ${{ vars.BUILD_COMMAND || 'npm run build' }}
+
+      - name: Resolve deploy directory
+        id: deploy_dir
+        run: |
+          if [ "${{ steps.detect.outputs.is_node }}" = "true" ]; then
+            # Explicit BUILD_OUTPUT_DIR wins; otherwise auto-detect the
+            # usual suspects so a copy-pasted Node project "just works".
+            if [ -n "${{ vars.BUILD_OUTPUT_DIR }}" ]; then
+              CANDIDATE="src/${{ vars.BUILD_OUTPUT_DIR }}"
+              if [ ! -d "$CANDIDATE" ]; then
+                echo "❌ BUILD_OUTPUT_DIR is set to '${{ vars.BUILD_OUTPUT_DIR }}' but 'src/${{ vars.BUILD_OUTPUT_DIR }}' does not exist after the build."
+                exit 1
+              fi
+              DEPLOY_DIR="$CANDIDATE"
+            else
+              DEPLOY_DIR=""
+              for candidate in dist build out public; do
+                if [ -d "src/$candidate" ]; then
+                  DEPLOY_DIR="src/$candidate"
+                  break
+                fi
+              done
+              if [ -z "$DEPLOY_DIR" ]; then
+                echo "❌ Could not auto-detect the build output folder (looked for dist/, build/, out/, public/)."
+                echo "   Set the BUILD_OUTPUT_DIR variable to the folder your build produces."
+                exit 1
+              fi
+            fi
+          else
+            DEPLOY_DIR="src"
+          fi
+          echo "📦 Deploy directory: $DEPLOY_DIR"
+          echo "dir=$DEPLOY_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_KEY_SECRET }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy to S3
+        run: |
+          DEST="s3://${{ vars.S3_BUCKET }}"
+          if [ -n "${{ vars.S3_PREFIX }}" ]; then
+            DEST="$DEST/${{ vars.S3_PREFIX }}"
+          fi
+          echo "🚀 Deploying '${{ steps.deploy_dir.outputs.dir }}' to '$DEST/' (${{ needs.resolve-environment.outputs.environment }})..."
+          aws s3 sync "${{ steps.deploy_dir.outputs.dir }}/" "$DEST/" \
+            --exclude ".gitignore" \
+            --exclude ".gitkeep" \
+            --delete \
+            --cache-control "public, max-age=86400"
+          echo "✅ Site deployed"
+
+      - name: Get CloudFront Distribution ID by domain
+        id: get_cf_id
+        run: |
+          echo "🔍 Looking up the CloudFront distribution serving ${{ vars.SITE_DOMAIN }}..."
+          RAW_IDS=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?contains(Aliases.Items || \`[]\`, '${{ vars.SITE_DOMAIN }}')].Id" \
+            --output text)
+
+          if [ -z "$RAW_IDS" ]; then
+            echo "❌ No CloudFront distribution has '${{ vars.SITE_DOMAIN }}' as an alias!"
+            echo "Available distributions:"
+            aws cloudfront list-distributions --query "DistributionList.Items[*].[Id,Comment,Aliases.Items[0]]" --output table
+            exit 1
+          fi
+
+          CF_ID=$(echo "$RAW_IDS" | awk '{print $1}')
+          ID_COUNT=$(echo "$RAW_IDS" | awk '{print NF}')
+
+          if [ "$ID_COUNT" -gt 1 ]; then
+            echo "⚠️  Warning: $ID_COUNT distributions matched '${{ vars.SITE_DOMAIN }}' (expected 1): $RAW_IDS"
+            echo "    Using the first one ($CF_ID). SITE_DOMAIN should be a unique alias per environment."
+          fi
+
+          echo "✅ Found CloudFront ID: $CF_ID"
+          echo "cf_id=$CF_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          echo "🔄 Invalidating CloudFront cache..."
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.get_cf_id.outputs.cf_id }}" \
+            --paths "/*"
+          echo "✅ Cache invalidation initiated"
+
+      - name: Deployment summary
+        run: |
+          echo "=========================================="
+          echo "🎉 Deployment completed successfully!"
+          echo "=========================================="
+          echo ""
+          echo "🌎 Environment: ${{ needs.resolve-environment.outputs.environment }}"
+          echo "🌐 URL: https://${{ vars.SITE_DOMAIN }}/"
+          echo "🪣 S3: s3://${{ vars.S3_BUCKET }}/${{ vars.S3_PREFIX }}"
+          echo "☁️  CloudFront ID: ${{ steps.get_cf_id.outputs.cf_id }}"
+          echo ""
+          echo "⏱️  CloudFront cache invalidation in progress."
+          echo "    Changes will be visible in a few minutes."
+          echo ""
